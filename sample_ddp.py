@@ -41,6 +41,13 @@ def create_npz_from_sample_folder(sample_dir, num=50_000):
     return npz_path
 
 
+def infer_learn_sigma_from_state_dict(state_dict, patch_size=2, in_channels=4):
+    final_bias = state_dict.get("final_layer.linear.bias")
+    if final_bias is None:
+        return False
+    return final_bias.numel() == patch_size * patch_size * in_channels * 2
+
+
 def main(mode, args):
     """
     Run sampling.
@@ -64,19 +71,20 @@ def main(mode, args):
         assert args.num_classes == 1000
         assert args.image_size == 256, "512x512 models are not yet available for auto-download." # remove this line when 512x512 models are available
         learn_sigma = args.image_size == 256
+        ckpt_path = f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
+        state_dict = find_model(ckpt_path)
     else:
-        learn_sigma = False
+        state_dict = find_model(args.ckpt)
+        learn_sigma = infer_learn_sigma_from_state_dict(state_dict)
 
     # Load model:
     latent_size = args.image_size // 8
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
+        use_null_label=args.use_null_label,
         learn_sigma=learn_sigma,
     ).to(device)
-    # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
-    ckpt_path = args.ckpt or f"SiT-XL-2-{args.image_size}x{args.image_size}.pt"
-    state_dict = find_model(ckpt_path)
     model.load_state_dict(state_dict)
     model.eval()  # important!
     
@@ -117,7 +125,7 @@ def main(mode, args):
         )
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
     assert args.cfg_scale >= 1.0, "In almost all cases, cfg_scale be >= 1.0"
-    using_cfg = args.cfg_scale > 1.0
+    using_cfg = args.cfg_scale > 1.0 and not args.use_null_label
 
     # Create folder to save samples:
     model_string_name = args.model.replace("/", "-")
@@ -157,16 +165,19 @@ def main(mode, args):
     for i in pbar:
         # Sample inputs:
         z = torch.randn(n, model.in_channels, latent_size, latent_size, device=device)
-        y = torch.randint(0, args.num_classes, (n,), device=device)
-        
         # Setup classifier-free guidance:
-        if using_cfg:
+        if args.use_null_label:
+            model_kwargs = {}
+            model_fn = model.forward
+        elif using_cfg:
+            y = torch.randint(0, args.num_classes, (n,), device=device)
             z = torch.cat([z, z], 0)
-            y_null = torch.tensor([1000] * n, device=device)
+            y_null = torch.tensor([args.num_classes] * n, device=device)
             y = torch.cat([y, y_null], 0)
             model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
             model_fn = model.forward_with_cfg
         else:
+            y = torch.randint(0, args.num_classes, (n,), device=device)
             model_kwargs = dict(y=y)
             model_fn = model.forward
 
@@ -211,8 +222,10 @@ if __name__ == "__main__":
     parser.add_argument("--sample-dir", type=str, default="samples")
     parser.add_argument("--per-proc-batch-size", type=int, default=4)
     parser.add_argument("--num-fid-samples", type=int, default=50_000)
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, choices=[128, 256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--use-null-label", action="store_true",
+                        help="Sample unconditionally by using the model's null label token.")
     parser.add_argument("--cfg-scale",  type=float, default=1.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--global-seed", type=int, default=0)

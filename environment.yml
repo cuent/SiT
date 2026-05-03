@@ -13,4 +13,6 @@ dependencies:
     - diffusers
     - accelerate
     - torchdiffeq
+    - "torchmetrics[image]"
+    - torch-fidelity
     - wandb

@@ -38,6 +38,7 @@ def main(mode, args):
     model = SiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
+        use_null_label=args.use_null_label,
         learn_sigma=learn_sigma,
     ).to(device)
     # Auto-download a pre-trained model or load a custom SiT checkpoint from train.py:
@@ -84,24 +85,30 @@ def main(mode, args):
 
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
 
-    # Labels to condition the model with (feel free to change):
-    class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
-    
-    # Create sampling noise:
-    n = len(class_labels)
-    z = torch.randn(n, 4, latent_size, latent_size, device=device)
-    y = torch.tensor(class_labels, device=device)
+    if args.use_null_label:
+        n = args.num_samples
+        z = torch.randn(n, 4, latent_size, latent_size, device=device)
+        model_fn = model.forward
+        model_kwargs = {}
+    else:
+        # Labels to condition the model with (feel free to change):
+        class_labels = [207, 360, 387, 974, 88, 979, 417, 279]
+        n = len(class_labels)
+        z = torch.randn(n, 4, latent_size, latent_size, device=device)
+        y = torch.tensor(class_labels, device=device)
 
-    # Setup classifier-free guidance:
-    z = torch.cat([z, z], 0)
-    y_null = torch.tensor([1000] * n, device=device)
-    y = torch.cat([y, y_null], 0)
-    model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
+        # Setup classifier-free guidance:
+        z = torch.cat([z, z], 0)
+        y_null = torch.tensor([args.num_classes] * n, device=device)
+        y = torch.cat([y, y_null], 0)
+        model_fn = model.forward_with_cfg
+        model_kwargs = dict(y=y, cfg_scale=args.cfg_scale)
 
     # Sample images:
     start_time = time()
-    samples = sample_fn(z, model.forward_with_cfg, **model_kwargs)[-1]
-    samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
+    samples = sample_fn(z, model_fn, **model_kwargs)[-1]
+    if not args.use_null_label:
+        samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
     samples = vae.decode(samples / 0.18215).sample
     print(f"Sampling took {time() - start_time:.2f} seconds.")
 
@@ -123,8 +130,11 @@ if __name__ == "__main__":
     
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="mse")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, choices=[128, 256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--use-null-label", action="store_true",
+                        help="Sample unconditionally by using the model's null label token.")
+    parser.add_argument("--num-samples", type=int, default=8)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--num-sampling-steps", type=int, default=250)
     parser.add_argument("--seed", type=int, default=0)

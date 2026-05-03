@@ -23,6 +23,7 @@ from time import time
 import argparse
 import logging
 import os
+import re
 
 from models import SiT_models
 from download import find_model
@@ -82,6 +83,16 @@ def create_logger(logging_dir):
     return logger
 
 
+def infer_train_steps_from_checkpoint_path(ckpt_path):
+    """
+    Infer global train steps from checkpoint filenames like 0050000.pt.
+    """
+    match = re.fullmatch(r"(\d+)\.pt", os.path.basename(ckpt_path))
+    if match is None:
+        return None
+    return int(match.group(1))
+
+
 def center_crop_arr(pil_image, image_size):
     """
     Center cropping implementation from ADM.
@@ -112,6 +123,29 @@ def main(args):
     Trains a new SiT model.
     """
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
+    resume_checkpoint = None
+
+    if args.ckpt is not None:
+        resume_checkpoint = find_model(args.ckpt, extract_ema=False)
+        if "args" in resume_checkpoint:
+            resume_args = vars(resume_checkpoint["args"]).copy()
+            # Keep a small set of runtime/continuation overrides from the current CLI.
+            resume_overrides = {
+                "data_path": args.data_path,
+                "results_dir": args.results_dir,
+                "epochs": args.epochs,
+                "global_batch_size": args.global_batch_size,
+                "num_workers": args.num_workers,
+                "log_every": args.log_every,
+                "ckpt_every": args.ckpt_every,
+                "sample_every": args.sample_every,
+                "ckpt": args.ckpt,
+                "wandb": args.wandb,
+                "wandb_run_id": args.wandb_run_id or resume_args.get("wandb_run_id"),
+                "start_step": args.start_step,
+            }
+            resume_args.update(resume_overrides)
+            args = argparse.Namespace(**resume_args)
 
     # Setup DDP:
     dist.init_process_group("nccl")
@@ -140,7 +174,7 @@ def main(args):
         entity = os.environ["ENTITY"]
         project = os.environ["PROJECT"]
         if args.wandb:
-            wandb_utils.initialize(args, entity, experiment_name, project)
+            args.wandb_run_id = wandb_utils.initialize(args, entity, experiment_name, project)
     else:
         logger = create_logger(None)
 
@@ -149,20 +183,13 @@ def main(args):
     latent_size = args.image_size // 8
     model = SiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        use_null_label=args.use_null_label
     )
 
     # Note that parameter initialization is done within the SiT constructor
     ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-
-    if args.ckpt is not None:
-        ckpt_path = args.ckpt
-        state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict["model"])
-        ema.load_state_dict(state_dict["ema"])
-        opt.load_state_dict(state_dict["opt"])
-        args = state_dict["args"]
-
+    
     requires_grad(ema, False)
     
     model = DDP(model.to(device), device_ids=[device])
@@ -179,6 +206,12 @@ def main(args):
 
     # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
     opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+
+    if resume_checkpoint is not None:
+        model.module.load_state_dict(resume_checkpoint["model"])
+        ema.load_state_dict(resume_checkpoint["ema"])
+        opt.load_state_dict(resume_checkpoint["opt"])
+        logger.info(f"Resumed training from checkpoint: {args.ckpt}")
 
     # Setup data:
     transform = transforms.Compose([
@@ -212,31 +245,49 @@ def main(args):
     ema.eval()  # EMA model should always be in eval mode
 
     # Variables for monitoring/logging purposes:
+    start_epoch = 0
     train_steps = 0
     log_steps = 0
     running_loss = 0
     start_time = time()
 
+    if resume_checkpoint is not None:
+        start_epoch = resume_checkpoint.get("epoch", 0)
+        train_steps = resume_checkpoint.get("train_steps")
+        if train_steps is None:
+            if args.start_step > 0:
+                train_steps = args.start_step
+                logger.info(f"Using manual start step {train_steps}.")
+            else:
+                inferred_train_steps = infer_train_steps_from_checkpoint_path(args.ckpt)
+                if inferred_train_steps is not None:
+                    train_steps = inferred_train_steps
+                    logger.info(f"Recovered train step {train_steps} from checkpoint filename.")
+                else:
+                    train_steps = 0
+                    logger.warning("Checkpoint is missing train_steps metadata; defaulting to train step 0.")
+        logger.info(f"Resuming from train step {train_steps} (loop epoch starts at {start_epoch}).")
+
     # Labels to condition the model with (feel free to change):
-    ys = torch.randint(1000, size=(local_batch_size,), device=device)
-    use_cfg = args.cfg_scale > 1.0
+    ys = None if args.use_null_label else torch.randint(args.num_classes, size=(local_batch_size,), device=device)
+    use_cfg = args.cfg_scale > 1.0 and not args.use_null_label
     # Create sampling noise:
-    n = ys.size(0)
+    n = local_batch_size
     zs = torch.randn(n, 4, latent_size, latent_size, device=device)
 
     # Setup classifier-free guidance:
     if use_cfg:
         zs = torch.cat([zs, zs], 0)
-        y_null = torch.tensor([1000] * n, device=device)
+        y_null = torch.tensor([args.num_classes] * n, device=device)
         ys = torch.cat([ys, y_null], 0)
         sample_model_kwargs = dict(y=ys, cfg_scale=args.cfg_scale)
         model_fn = ema.forward_with_cfg
     else:
-        sample_model_kwargs = dict(y=ys)
+        sample_model_kwargs = {} if args.use_null_label else dict(y=ys)
         model_fn = ema.forward
 
     logger.info(f"Training for {args.epochs} epochs...")
-    for epoch in range(args.epochs):
+    for epoch in range(start_epoch, args.epochs):
         sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
         for x, y in loader:
@@ -245,7 +296,7 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            model_kwargs = dict(y=y)
+            model_kwargs = {} if args.use_null_label else dict(y=y)
             loss_dict = transport.training_losses(model, x, model_kwargs)
             loss = loss_dict["loss"].mean()
             opt.zero_grad()
@@ -284,7 +335,9 @@ def main(args):
                         "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
                         "opt": opt.state_dict(),
-                        "args": args
+                        "args": args,
+                        "epoch": epoch,
+                        "train_steps": train_steps,
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
                     torch.save(checkpoint, checkpoint_path)
@@ -321,8 +374,10 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=True)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image-size", type=int, choices=[128, 256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
+    parser.add_argument("--use-null-label", action="store_true",
+                        help="Train unconditionally by always using the model's null label token.")
     parser.add_argument("--epochs", type=int, default=1400)
     parser.add_argument("--global-batch-size", type=int, default=256)
     parser.add_argument("--global-seed", type=int, default=0)
@@ -333,6 +388,10 @@ if __name__ == "__main__":
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
+    parser.add_argument("--wandb-run-id", type=str, default=None,
+                        help="Optional Weights & Biases run ID to resume logging into")
+    parser.add_argument("--start-step", type=int, default=0,
+                        help="Manual train step to resume from when checkpoint metadata is unavailable")
     parser.add_argument("--ckpt", type=str, default=None,
                         help="Optional path to a custom SiT checkpoint")
 

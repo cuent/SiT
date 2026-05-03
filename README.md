@@ -116,6 +116,18 @@ torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-XL/2 --data-path /pa
 torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-XL/2 --data-path /path/to/imagenet/train --path-type Linear --prediction noise
 ```
 
+**Unconditional / unsupervised training.** To train without class conditioning, pass a single dummy class plus the null-label flag. The dataloader may still return ImageFolder labels, but the model ignores them and always uses its null token:
+
+```bash
+torchrun --nnodes=1 --nproc_per_node=N train.py --model SiT-XL/2 --data-path /path/to/imagefolder/train --num-classes 1 --use-null-label --cfg-scale 1.0
+```
+
+Sample from that checkpoint with the same model settings:
+
+```bash
+python sample.py ODE --model SiT-XL/2 --image-size 256 --ckpt /path/to/model.pt --num-classes 1 --use-null-label
+```
+
 **Resume training.** To resume training from custom checkpoint:
 
 ```bash
@@ -165,5 +177,3 @@ versus 2.06 in the paper).
 
 ## License
 This project is under the MIT license. See [LICENSE](LICENSE.txt) for details.
-
-
